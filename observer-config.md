@@ -2,6 +2,8 @@
 This document shows how to configure observer cluster, Envoy proxy, and Thanos components.
 
 # Configure the observer cluster
+Using `helm-envoy` and `helm-thanos` charts.
+
 As per our design, we need to access the prometheus metrics from the centralized observer cluster across all the clusters that we need to monitor.
 
 We need to also set up kube-prometheus-stack in the Observer cluster for to monitor the health of the Observer cluster and the components installed in the Observer cluster itself.
@@ -21,7 +23,7 @@ We can use the default `values.yaml` and `shared-values.yaml` file in repository
 ```sh
 helm upgrade -i prometheus . -n platform --values=shared-values.yaml --values=observer-prod-values.yaml
 ```
-# Configure the envoy proxy
+# Configure the envoy proxy with `helm-envoy chart`
 Because the certificate validation fails against ALB with error transport: `authentication handshake failed: x509: cannot validate certificate for xxx because it doesn't contain any IP SANs.`
 
 Thanos underneath uses golang with gRPC protocol which fails if the certificate has missing fields.
@@ -104,3 +106,63 @@ files:
               - "h2"
 ```
 
+# Configure thanos with `helm-thanos chart`
+Components of thanos:
+- Thanos Querier aggregates and optionally deduplicates multiple metrics backends under single Prometheus Query endpoint.
+- Thanos Store (or Store Gateway) implements the Store API on top of historical data in an object storage bucket. It acts primarily as an API gateway and therefore does not need significant amounts of local disk space.
+- Thanos Compactor applies the compaction procedure of the Prometheus 2.0 storage engine to block data stored in object storage. It is also responsible for creating 5m downsampling for blocks larger than 40 hours (2d, 2w) and creating 1h downsampling for blocks larger than 10 days (2w)
+
+Create a sample `shared-values.yaml` file with following configuration
+```sh
+image:
+  tag: v0.18.0
+
+sidecar:
+  enabled: true
+  namespace: platform
+
+query:
+  storeDNSDiscovery: true
+  sidecarDNSDiscovery: true
+
+store:
+  enabled: true
+  serviceAccount: "thanos-store"
+
+bucket:
+  enabled: true
+  serviceAccount: "thanos-store"
+
+compact:
+  enabled: true
+  serviceAccount: "thanos-store"
+
+objstore:
+  type: S3
+  config:
+    endpoint: s3.ap-northeast-1.amazonaws.com
+    sse_config:
+      type: "SSE-S3"
+```
+
+Create env specific values file for the hlem chart with `prod-values.yaml`:
+```sh
+objstore:
+  config:
+    # AWS S3 metrics bucket name
+    bucket: <bucket_name>
+
+query:
+  stores: 
+    - dnssrv+_clusterA._tcp.envoy
+  extraArgs:
+    - "--rule=dnssrv+_clusterA._tcp.envoy"
+    - "--rule=dnssrv+_grpc._tcp.thanos-sidecar-grpc.platform.svc.cluster.local"
+```
+
+Here, we use `dnssrv+` scheme to detect Thanos API servers through respective DNS lookups.
+
+`dnssrv+` scheme - With DNS SD, a domain name can be specified and it will be periodically queried to discover a list of IPs.
+The domain name after this prefix will be looked up as a SRV query, and then each SRV record will be looked up as an A/AAAA query. You do not need to specify a port as the one from the query results will be used.
+
+The second rule in the config `dnssrv+_grpc._tcp.thanos-sidecar-grpc.platform.svc.cluster.local` is required so that Thanos Querier can connect to the thanos sidecar in the local prometheus instance (observer cluster)
